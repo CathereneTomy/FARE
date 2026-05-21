@@ -369,62 +369,101 @@ import re
 import pandas as pd
 from rdkit import Chem
 
-def generate_final_molecules(combinations, scaffold_mol, similar_dfs, att_to_C_conversion):
-    """
-    Generate combined molecules from scaffold and fragments, clean SMILES, and return a DataFrame.
-    
-    Parameters
-    ----------
-    combinations : list
-        List of fragment index combinations.
-    scaffold_mol : RDKit Mol
-        Scaffold molecule.
-    similar_dfs : dict
-        Dictionary of DataFrames, keyed by attachment point, each containing 'new_mol' and 'frag_att'.
-    att_to_C_conversion : function
-        Function that converts a fragment molecule by setting the correct attachment atom.
+def remove_dummy_atoms(mol):
+    """Remove all dummy atoms (*) from a molecule."""
+    dummy_indices = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() == 0]
+    if not dummy_indices:
+        return mol
 
-    Returns
-    -------
-    final_mol_df : pd.DataFrame
-        DataFrame containing cleaned SMILES strings of all generated molecules.
-    """
+    edit = Chem.RWMol(mol)
+    for idx in sorted(dummy_indices, reverse=True):
+        edit.RemoveAtom(idx)
+
+    cleaned = edit.GetMol()
+    Chem.SanitizeMol(cleaned)
+    return cleaned
+
+def generate_final_molecules(combinations, scaffold_mol, similar_dfs, att_to_c_conversion):
+    """Generate combined molecules from scaffold and fragments."""
+
+    # ── valence helper (from attach_fragments_to_query) ──────────────────────
+    def has_free_valence(mol, idx):
+        atom = mol.GetAtomWithIdx(idx)
+        try:
+            atom.UpdatePropertyCache(strict=False)
+        except Exception:
+            pass
+        try:
+            if atom.GetNumImplicitHs() > 0:
+                return True, False
+        except RuntimeError:
+            pass
+        if atom.GetNumExplicitHs() > 0:
+            return True, True   # needs explicit H removal
+        return False, False
+
+    def remove_h_if_needed(rwmol, idx):
+        _, needs_h = has_free_valence(rwmol, idx)
+        if needs_h:
+            a = rwmol.GetAtomWithIdx(idx)
+            a.SetNumExplicitHs(max(0, a.GetNumExplicitHs() - 1))
+    # ─────────────────────────────────────────────────────────────────────────
+
     final_mols = []
 
     for c in combinations:
-        mol_num_i = scaffold_mol.GetNumAtoms()
+        try:
+            mol_num_i = scaffold_mol.GetNumAtoms()
 
-        for i, mol_i in enumerate(c):
-            att_pt = list(similar_dfs.keys())[i]
-            frag_i = similar_dfs[att_pt].loc[mol_i, 'new_mol']
-            frag_i = att_to_C_conversion(frag_i, None, [int(similar_dfs[att_pt].loc[mol_i, "frag_att"])])
+            for i, mol_i in enumerate(c):
+                att_pt = list(similar_dfs.keys())[i]
+                frag_i = similar_dfs[att_pt].loc[mol_i, 'new_mol']
+                frag_i = att_to_c_conversion(
+                    frag_i, None,
+                    [int(similar_dfs[att_pt].loc[mol_i, "frag_att"])]
+                )
 
-            if i == 0:
-                frag_att = mol_num_i + similar_dfs[att_pt].loc[mol_i, "frag_att"]
-                combo = Chem.CombineMols(scaffold_mol, frag_i)
-                combo_editable = Chem.EditableMol(combo)
-                combo_editable.AddBond(int(att_pt), int(frag_att), order=Chem.rdchem.BondType.SINGLE)
-            else:
-                new_mol_num_i = combo_editable.GetMol().GetNumAtoms()
-                frag_att = new_mol_num_i + similar_dfs[att_pt].loc[mol_i, "frag_att"]
-                combo = Chem.CombineMols(combo_editable.GetMol(), frag_i)
-                combo_editable = Chem.EditableMol(combo)
-                combo_editable.AddBond(int(att_pt), int(frag_att), order=Chem.rdchem.BondType.SINGLE)
+                if i == 0:
+                    frag_att = mol_num_i + similar_dfs[att_pt].loc[mol_i, "frag_att"]
+                    combo = Chem.CombineMols(scaffold_mol, frag_i)
+                    combo_rw = Chem.RWMol(combo)                   # ← RWMol for H removal
+                    remove_h_if_needed(combo_rw, int(att_pt))      # ← scaffold side
+                    remove_h_if_needed(combo_rw, int(frag_att))    # ← fragment side
+                    combo_editable = Chem.EditableMol(combo_rw)
+                    combo_editable.AddBond(
+                        int(att_pt), int(frag_att),
+                        order=Chem.rdchem.BondType.SINGLE
+                    )
+                else:
+                    current_mol = combo_editable.GetMol()
+                    new_mol_num_i = current_mol.GetNumAtoms()
+                    frag_att = new_mol_num_i + similar_dfs[att_pt].loc[mol_i, "frag_att"]
+                    combo = Chem.CombineMols(current_mol, frag_i)
+                    combo_rw = Chem.RWMol(combo)                   # ← RWMol for H removal
+                    remove_h_if_needed(combo_rw, int(att_pt))      # ← scaffold side
+                    remove_h_if_needed(combo_rw, int(frag_att))    # ← fragment side
+                    combo_editable = Chem.EditableMol(combo_rw)
+                    combo_editable.AddBond(
+                        int(att_pt), int(frag_att),
+                        order=Chem.rdchem.BondType.SINGLE
+                    )
 
-        combined_mol = combo_editable.GetMol()
-        Chem.SanitizeMol(combined_mol)
-        final_mols.append(combined_mol)
+            combined_mol = combo_editable.GetMol()
+            combined_mol = remove_dummy_atoms(combined_mol)
+            Chem.SanitizeMol(combined_mol)
+            final_mols.append(combined_mol)
 
-    # remove atom map numbers
+        except Exception:
+            continue
+
     for mol in final_mols:
         for atom in mol.GetAtoms():
             atom.SetAtomMapNum(0)
 
     smi = [Chem.MolToSmiles(mol) for mol in final_mols]
 
-  
-    def clean_bracketed_carbons(smiles: str) -> str:
-        fixed = re.sub(r"\[\d*C\]", "C", smiles)  # replace [C], [4C], [5C], etc. with C
+    def clean_bracketed_carbons(smiles):
+        fixed = re.sub(r"\[\d*C\]", "C", smiles)
         mol = Chem.MolFromSmiles(fixed)
         if mol is None:
             return None
@@ -435,8 +474,4 @@ def generate_final_molecules(combinations, scaffold_mol, similar_dfs, att_to_C_c
         return Chem.MolToSmiles(mol)
 
     cleaned_smi = [clean_bracketed_carbons(x) for x in smi]
-
-    # make DataFrame
-    final_mol_df = pd.DataFrame({"Smiles": cleaned_smi})
-
-    return final_mol_df
+    return pd.DataFrame({"smiles": cleaned_smi})
